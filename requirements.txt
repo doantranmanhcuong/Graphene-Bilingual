@@ -1,0 +1,6 @@
+streamlit
+openpyxl
+python-docx
+python-pptx
+python-dotenv
+requests
