@@ -116,12 +116,13 @@ class CloudDripEngine:
 
     def _process_chunk_worker(self, chunk_idx, chunk):
         json_payload = {str(i): text for i, text in enumerate(chunk)}
-        prompt = f"""You are a strict bilingual translation system. Translate the values of the following JSON object into {self.target_lang}.
+        prompt = f"""You are an expert professional translator specializing in legal, corporate, and formal documents. Translate the values of the following JSON object into {self.target_lang}.
+
 CRITICAL RULES:
-1. Translate accurately with NO additions, NO omissions.
-2. Keep numbers, product codes, abbreviations EXACTLY as the original.
-3. You MUST return ONLY a valid JSON object.
-4. The output keys MUST match the input keys exactly.
+1. FORMAL & NATURAL TONE: The translation must be highly professional, fluent, and suitable for formal contexts (e.g., contracts, official reports). Avoid clunky, word-for-word, or robotic translations. Use contextually appropriate terminology.
+2. STRICT FIDELITY: Absolutely NO hallucinations, additions, or omissions. Translate the exact meaning of the original text without making anything up.
+3. PRESERVE FORMATTING: Keep all numbers, product codes, abbreviations, and special characters EXACTLY as they appear in the original.
+4. JSON OUTPUT ONLY: You MUST return ONLY a valid JSON object. The output keys MUST match the input keys exactly.
 
 Input JSON:
 {json.dumps(json_payload, ensure_ascii=False)}"""
