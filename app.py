@@ -49,11 +49,45 @@ GROQ_API_KEYS = list(set([k for k in GROQ_API_KEYS if k]))
 TEMP_DIR = os.path.join(tempfile.gettempdir(), "bilingual_cloud")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
+import sqlite3
+import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import queue
+import threading
+
+def get_db_connection():
+    conn = sqlite3.connect(os.path.join(TEMP_DIR, 'translation_cache.db'))
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS cache
+                 (hash_key TEXT PRIMARY KEY, target_lang TEXT, original TEXT, translated TEXT)''')
+    conn.commit()
+    return conn
+
+def get_cached_translation(conn, original, target_lang):
+    hash_key = hashlib.md5((original + target_lang).encode('utf-8')).hexdigest()
+    c = conn.cursor()
+    c.execute("SELECT translated FROM cache WHERE hash_key=?", (hash_key,))
+    row = c.fetchone()
+    return row[0] if row else None
+
+def save_cached_translation(conn, original, target_lang, translated):
+    hash_key = hashlib.md5((original + target_lang).encode('utf-8')).hexdigest()
+    try:
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO cache (hash_key, target_lang, original, translated) VALUES (?, ?, ?, ?)",
+                  (hash_key, target_lang, original, translated))
+        conn.commit()
+    except Exception:
+        pass
+
 class CloudDripEngine:
     def __init__(self, target_lang):
         self.target_lang = target_lang
-        self.groq_keys = GROQ_API_KEYS
-        self.current_key_idx = 0
+        self.key_queue = queue.Queue()
+        if not GROQ_API_KEYS:
+            raise ValueError("Hệ thống không có bất kỳ GROQ_API_KEY nào được cấu hình!")
+        for k in GROQ_API_KEYS:
+            self.key_queue.put(k)
         
     def _clean_json(self, text):
         text = text.strip()
@@ -62,42 +96,52 @@ class CloudDripEngine:
         if text.endswith("```"): text = text[:-3]
         return text.strip()
         
-    def _call_groq(self, prompt, status_text=None):
-        if not self.groq_keys:
-            raise ValueError("Hệ thống không có bất kỳ GROQ_API_KEY nào được cấu hình!")
-            
-        attempts = len(self.groq_keys)
-        for i in range(attempts):
-            api_key = self.groq_keys[self.current_key_idx]
-            url = "https://api.groq.com/openai/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            }
-            data = {
-                "model": "openai/gpt-oss-120b",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.01,
-                "response_format": {"type": "json_object"}
-            }
-            
+    def _call_groq_single(self, prompt, api_key):
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": "openai/gpt-oss-120b",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.01,
+            "response_format": {"type": "json_object"}
+        }
+        response = requests.post(url, headers=headers, json=data, timeout=60)
+        if response.status_code == 200:
+            return response.json()['choices'][0]['message']['content']
+        else:
+            raise Exception(f"HTTP {response.status_code}: {response.text}")
+
+    def _process_chunk_worker(self, chunk_idx, chunk):
+        json_payload = {str(i): text for i, text in enumerate(chunk)}
+        prompt = f"""You are a strict bilingual translation system. Translate the values of the following JSON object into {self.target_lang}.
+CRITICAL RULES:
+1. Translate accurately with NO additions, NO omissions.
+2. Keep numbers, product codes, abbreviations EXACTLY as the original.
+3. You MUST return ONLY a valid JSON object.
+4. The output keys MUST match the input keys exactly.
+
+Input JSON:
+{json.dumps(json_payload, ensure_ascii=False)}"""
+
+        while True:
+            api_key = self.key_queue.get()
             try:
-                response = requests.post(url, headers=headers, json=data, timeout=40)
-                if response.status_code == 200:
-                    return response.json()['choices'][0]['message']['content']
-                elif response.status_code == 429: # Rate limit
-                    if status_text:
-                        status_text.text(f"🔄 Key Groq {self.current_key_idx + 1} bị Rate Limit. Đang xoay tua sang Key tiếp theo...")
-                    self.current_key_idx = (self.current_key_idx + 1) % len(self.groq_keys)
-                    continue
-                else:
-                    raise Exception(f"HTTP {response.status_code}: {response.text}")
-            except Exception as e:
-                if i == attempts - 1:
-                    raise e
-                self.current_key_idx = (self.current_key_idx + 1) % len(self.groq_keys)
+                res_text = self._call_groq_single(prompt, api_key)
+                translated_dict = json.loads(self._clean_json(res_text))
                 
-        raise Exception("Tất cả các Key Groq đều thất bại hoặc bị Rate Limit!")
+                results = []
+                for i in range(len(chunk)):
+                    results.append(translated_dict.get(str(i), chunk[i]))
+                    
+                self.key_queue.put(api_key)
+                time.sleep(2) # Nhỏ giọt an toàn
+                return results
+            except Exception as e:
+                self.key_queue.put(api_key)
+                time.sleep(15) # Ngủ đông nếu API nghẽn hoặc hết hạn mức
 
     def translate_batch(self, texts, progress_bar=None, status_text=None):
         if not texts:
@@ -127,13 +171,31 @@ class CloudDripEngine:
         if not unique_texts:
             return processed_results
             
-        draft_results = []
-        # THUẬT TOÁN NHỎ GIỌT: Chỉ gửi 10 câu mỗi lần
-        batch_size = 10 
+        conn = get_db_connection()
+        cached_results = {}
+        missing_texts = []
         
+        for idx, text in enumerate(unique_texts):
+            cached = get_cached_translation(conn, text, self.target_lang)
+            if cached:
+                cached_results[text] = cached
+            else:
+                missing_texts.append(text)
+                
+        if not missing_texts:
+            if status_text:
+                status_text.text("⚡ Phục hồi 100% từ bộ nhớ đệm (Cache)...")
+            draft_results = [cached_results.get(text, text) for text in unique_texts]
+            
+            for i, original_idx in enumerate(to_translate_indices):
+                unique_idx = text_to_unique_idx[i]
+                processed_results[original_idx] = draft_results[unique_idx]
+            return processed_results
+
+        batch_size = 10 
         chunks = []
         current_chunk = []
-        for text in unique_texts:
+        for text in missing_texts:
             current_chunk.append(text)
             if len(current_chunk) >= batch_size:
                 chunks.append(current_chunk)
@@ -142,43 +204,35 @@ class CloudDripEngine:
             chunks.append(current_chunk)
             
         total_chunks = len(chunks)
-        for chunk_idx, chunk in enumerate(chunks):
-            if progress_bar and status_text:
-                progress_val = int(((chunk_idx) / total_chunks) * 100)
-                progress_bar.progress(progress_val)
-                status_text.text(f"🚀 Đang dịch cụm {chunk_idx+1}/{total_chunks}...")
+        max_workers = max(1, len(GROQ_API_KEYS))
+        completed_chunks = 0
+        
+        if status_text:
+            status_text.text(f"🚀 Kích hoạt Đa Luồng ({max_workers} luồng). Đang xử lý {total_chunks} cụm...")
             
-            json_payload = {str(i): text for i, text in enumerate(chunk)}
-            prompt = f"""You are a strict bilingual translation system. Translate the values of the following JSON object into {self.target_lang}.
-CRITICAL RULES:
-1. Translate accurately with NO additions, NO omissions.
-2. Keep numbers, product codes, abbreviations EXACTLY as the original.
-3. You MUST return ONLY a valid JSON object.
-4. The output keys MUST match the input keys exactly.
-
-Input JSON:
-{json.dumps(json_payload, ensure_ascii=False)}"""
-
-            success = False
-            for attempt in range(2):
-                try:
-                    res_text = self._call_groq(prompt, status_text)
-                    translated_dict = json.loads(res_text)
-                    for i in range(len(chunk)):
-                        draft_results.append(translated_dict.get(str(i), chunk[i]))
-                    success = True
-                    break
-                except Exception as e:
-                    if status_text:
-                        status_text.text(f"⚠️ Groq nghẽn cụm {chunk_idx+1}. Thử lại (Lần {attempt+1}/2)...")
-                    time.sleep(5)
-                    
-            if not success:
-                # Nếu xui quá xui thử 2 lần đều tạch, giữ nguyên bản gốc
-                draft_results.extend(chunk)
+        futures = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for chunk_idx, chunk in enumerate(chunks):
+                future = executor.submit(self._process_chunk_worker, chunk_idx, chunk)
+                futures[future] = (chunk_idx, chunk)
                 
-            # Nghỉ 4.5 giây giữa mỗi yêu cầu để xả Rate Limit của cả 2 hệ thống
-            time.sleep(4.5) 
+            for future in as_completed(futures):
+                chunk_idx, chunk = futures[future]
+                results = future.result()
+                
+                for orig, trans in zip(chunk, results):
+                    save_cached_translation(conn, orig, self.target_lang, trans)
+                    cached_results[orig] = trans
+                    
+                completed_chunks += 1
+                if progress_bar and status_text:
+                    progress_val = int((completed_chunks / total_chunks) * 100)
+                    progress_bar.progress(progress_val)
+                    status_text.text(f"🚀 Tiến độ: {completed_chunks}/{total_chunks} cụm (Đa luồng chống lỗi)")
+
+        draft_results = []
+        for text in unique_texts:
+            draft_results.append(cached_results.get(text, text))
 
         for i, original_idx in enumerate(to_translate_indices):
             unique_idx = text_to_unique_idx[i]
