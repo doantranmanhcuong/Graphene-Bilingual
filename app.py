@@ -54,6 +54,13 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
 import threading
+import re
+
+class RateLimitException(Exception):
+    def __init__(self, message, wait_time):
+        self.message = message
+        self.wait_time = wait_time
+        super().__init__(self.message)
 
 def get_db_connection():
     conn = sqlite3.connect(os.path.join(TEMP_DIR, 'translation_cache.db'))
@@ -111,10 +118,27 @@ class CloudDripEngine:
         response = requests.post(url, headers=headers, json=data, timeout=60)
         if response.status_code == 200:
             return response.json()['choices'][0]['message']['content']
+        elif response.status_code == 429:
+            try:
+                err_msg = response.json().get("error", {}).get("message", "")
+                match = re.search(r'try again in (?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?', err_msg)
+                wait_time = 15
+                if match:
+                    h, m, s = match.groups()
+                    total = 0
+                    if h: total += int(h) * 3600
+                    if m: total += int(m) * 60
+                    if s: total += float(s)
+                    wait_time = total + 5 # Thêm 5s đệm cho an toàn
+                raise RateLimitException(err_msg, wait_time)
+            except RateLimitException as re_err:
+                raise re_err
+            except Exception:
+                raise RateLimitException(response.text, 15)
         else:
             raise Exception(f"HTTP {response.status_code}: {response.text}")
 
-    def _process_chunk_worker(self, chunk_idx, chunk):
+    def _process_chunk_worker(self, chunk_idx, chunk, status_text=None):
         json_payload = {str(i): text for i, text in enumerate(chunk)}
         prompt = f"""You are an expert professional translator specializing in legal, corporate, and formal documents. Translate the values of the following JSON object into {self.target_lang}.
 
@@ -140,9 +164,14 @@ Input JSON:
                 self.key_queue.put(api_key)
                 time.sleep(2) # Nhỏ giọt an toàn
                 return results
+            except RateLimitException as e:
+                if status_text:
+                    status_text.text(f"⚠️ Key Groq chạm ngưỡng giới hạn. Tự động nghỉ {int(e.wait_time)}s để hồi phục (Đừng đóng trình duyệt)...")
+                time.sleep(e.wait_time)
+                self.key_queue.put(api_key)
             except Exception as e:
                 self.key_queue.put(api_key)
-                time.sleep(15) # Ngủ đông nếu API nghẽn hoặc hết hạn mức
+                time.sleep(15) # Ngủ đông nếu API nghẽn hoặc lỗi khác
 
     def translate_batch(self, texts, progress_bar=None, status_text=None):
         if not texts:
@@ -214,7 +243,7 @@ Input JSON:
         futures = {}
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             for chunk_idx, chunk in enumerate(chunks):
-                future = executor.submit(self._process_chunk_worker, chunk_idx, chunk)
+                future = executor.submit(self._process_chunk_worker, chunk_idx, chunk, status_text)
                 futures[future] = (chunk_idx, chunk)
                 
             for future in as_completed(futures):
