@@ -75,7 +75,12 @@ def get_cached_translation(conn, original, target_lang):
     c = conn.cursor()
     c.execute("SELECT translated FROM cache WHERE hash_key=?", (hash_key,))
     row = c.fetchone()
-    return row[0] if row else None
+    if row and row[0]:
+        val = row[0]
+        if isinstance(val, str):
+            val = val.replace('\\t', '\t').replace('\\r', '\r').replace('\\n', '\n')
+        return val
+    return None
 
 def save_cached_translation(conn, original, target_lang, translated):
     hash_key = hashlib.md5((original + target_lang).encode('utf-8')).hexdigest()
@@ -140,13 +145,14 @@ class CloudDripEngine:
 
     def _process_chunk_worker(self, chunk_idx, chunk, status_text=None):
         json_payload = {str(i): text for i, text in enumerate(chunk)}
-        prompt = f"""You are an expert professional translator specializing in legal, corporate, and formal documents. Translate the values of the following JSON object into {self.target_lang}.
+        prompt = f"""You are an expert professional translator specializing in legal, corporate, and formal technical documents (including SDS and contracts). Translate the values of the following JSON object into {self.target_lang}.
 
 CRITICAL RULES:
-1. FORMAL & NATURAL TONE: The translation must be highly professional, fluent, and suitable for formal contexts (e.g., contracts, official reports). Avoid clunky, word-for-word, or robotic translations. Use contextually appropriate terminology.
+1. FORMAL & NATURAL TONE: The translation must be highly professional, fluent, and suitable for official/technical contexts. Avoid clunky, word-for-word, or robotic translations. Use contextually appropriate terminology according to standards (e.g., GHS / ABNT NBR 14725 for SDS).
 2. STRICT FIDELITY: Absolutely NO hallucinations, additions, or omissions. Translate the exact meaning of the original text without making anything up.
 3. PRESERVE FORMATTING: Keep all numbers, product codes, abbreviations, and special characters EXACTLY as they appear in the original.
-4. JSON OUTPUT ONLY: You MUST return ONLY a valid JSON object. The output keys MUST match the input keys exactly.
+4. NO ESCAPED SEQUENCES: Do NOT output visible escaped sequences like '\\t' or '\\n' as literal text. Maintain natural spacing and column alignment.
+5. JSON OUTPUT ONLY: You MUST return ONLY a valid JSON object. The output keys MUST match the input keys exactly.
 
 Input JSON:
 {json.dumps(json_payload, ensure_ascii=False)}"""
@@ -159,7 +165,10 @@ Input JSON:
                 
                 results = []
                 for i in range(len(chunk)):
-                    results.append(translated_dict.get(str(i), chunk[i]))
+                    val = translated_dict.get(str(i), chunk[i])
+                    if isinstance(val, str):
+                        val = val.replace('\\t', '\t').replace('\\r', '\r').replace('\\n', '\n')
+                    results.append(val)
                     
                 self.key_queue.put(api_key)
                 time.sleep(2) # Nhỏ giọt an toàn
@@ -343,6 +352,7 @@ class DocumentProcessor:
         
         for cell, trans in zip(cells, translations):
             if trans.lower() != str(cell.value).strip().lower():
+                clean_trans = trans.replace('\\t', '    ').replace('\\r', '').replace('\\n', '\n')
                 is_explicitly_wrapped = cell.alignment and cell.alignment.wrap_text
                 
                 # Kiểm tra xem ô có thuộc Merged Cells không
@@ -361,7 +371,7 @@ class DocumentProcessor:
                 
                 if should_wrap:
                     # Chèn bản dịch xuống dòng
-                    new_text = str(cell.value) + "\n" + trans
+                    new_text = str(cell.value) + "\n" + clean_trans
                     cell.value = new_text
                     
                     if cell.alignment:
@@ -379,16 +389,43 @@ class DocumentProcessor:
                         sheet.row_dimensions[cell.row].height = calculated_height
                 else:
                     # Các ô tiêu đề không gộp ô và có không gian trống để tràn ngang -> Dùng dấu " / "
-                    cell.value = str(cell.value) + " / " + trans
+                    cell.value = str(cell.value) + " / " + clean_trans
             
         filename = self._get_output_filename(file_path)
         output_path = os.path.join(TEMP_DIR, filename)
         wb.save(output_path)
         return output_path
 
+    def _detect_doc_default_font(self, doc):
+        try:
+            rFonts = doc.styles.element.xpath('.//w:docDefaults//w:rFonts')
+            if rFonts:
+                val = rFonts[0].get(qn('w:ascii')) or rFonts[0].get(qn('w:hAnsi')) or rFonts[0].get(qn('w:cs'))
+                if val:
+                    return val
+        except Exception:
+            pass
+        try:
+            if doc.styles['Normal'].font.name:
+                return doc.styles['Normal'].font.name
+        except Exception:
+            pass
+        return "Times New Roman"
+
+    def _set_run_font(self, run, font_name):
+        if font_name:
+            run.font.name = font_name
+            rPr = run._r.get_or_add_rPr()
+            rFonts = rPr.get_or_add_rFonts()
+            rFonts.set(qn('w:ascii'), font_name)
+            rFonts.set(qn('w:hAnsi'), font_name)
+            rFonts.set(qn('w:cs'), font_name)
+
     def process_word(self, file_path):
         import copy
         doc = docx.Document(file_path)
+        default_doc_font = self._detect_doc_default_font(doc)
+        
         texts = []
         paragraphs = []
         
@@ -402,23 +439,77 @@ class DocumentProcessor:
             
         for p, trans in zip(paragraphs, translations):
             if trans.lower() != p.text.strip().lower():
-                # Nhân bản paragraph để giữ nguyên TẤT CẢ định dạng (Justify, Bullet, Indent)
+                clean_trans = trans.replace('\\t', '\t').replace('\\r', '\r').replace('\\n', '\n')
+                
+                # Trích xuất kiểu dáng font, cỡ chữ, độ đậm và màu sắc từ đoạn gốc
+                orig_font_name = None
+                orig_font_size = None
+                orig_is_bold = False
+                is_white_or_light = False
+                
+                for r in p.runs:
+                    if r.text.strip():
+                        if r.font.name and not orig_font_name:
+                            orig_font_name = r.font.name
+                        if r.font.size and not orig_font_size:
+                            orig_font_size = r.font.size
+                        if r.bold:
+                            orig_is_bold = True
+                        if r.font.color and r.font.color.rgb:
+                            rgb = r.font.color.rgb
+                            if rgb == RGBColor(255, 255, 255) or (rgb[0] > 200 and rgb[1] > 200 and rgb[2] > 200):
+                                is_white_or_light = True
+                                
+                # Kiểm tra màu nền tối của paragraph (shading)
+                shd = p._p.xpath('.//w:pPr/w:shd')
+                if shd:
+                    shd_val = shd[0].get(qn('w:fill'))
+                    if shd_val and shd_val.lower() not in ['auto', 'none', 'ffffff']:
+                        is_white_or_light = True
+                
+                # Kiểm tra màu nền tối nếu đoạn văn nằm trong ô bảng (table cell)
+                tc_shd = p._p.xpath('ancestor::w:tc[1]//w:tcPr/w:shd')
+                if tc_shd:
+                    tc_shd_val = tc_shd[0].get(qn('w:fill'))
+                    if tc_shd_val and tc_shd_val.lower() not in ['auto', 'none', 'ffffff']:
+                        is_white_or_light = True
+
+                font_to_apply = orig_font_name or default_doc_font
+
+                # Nhân bản paragraph để giữ nguyên TẤT CẢ định dạng khối (Justify, Indent, Tabs...)
                 new_p = copy.deepcopy(p._p)
                 p._p.addnext(new_p)
                 new_para = Paragraph(new_p, p._parent)
-                new_para.clear() # Xóa chữ cũ
+                new_para.clear() # Xóa nội dung run cũ
                 
-                # Ép đoạn văn gốc (Tiếng Việt) mất khoảng cách lề dưới (Space After)
-                # Giúp đoạn Tiếng Anh dính sát ngay bên dưới, tạo thành 1 cụm song ngữ hoàn hảo
+                # Điều chỉnh khoảng cách dòng: Đoạn gốc và bản dịch gắn kết chặt chẽ
                 try:
-                    p.paragraph_format.space_after = Pt(0)
-                except:
+                    orig_after = p.paragraph_format.space_after
+                    p.paragraph_format.space_after = Pt(1)
+                    if orig_after is not None and orig_after > Pt(0):
+                        new_para.paragraph_format.space_after = orig_after
+                    else:
+                        new_para.paragraph_format.space_after = Pt(4)
+                except Exception:
                     pass
                 
-                # Chèn bản dịch vào đoạn mới
-                new_run = new_para.add_run(trans)
+                # Thêm văn bản dịch vào run mới
+                new_run = new_para.add_run(clean_trans)
                 new_run.italic = True
-                new_run.font.color.rgb = RGBColor(0, 51, 102) 
+                if orig_is_bold:
+                    new_run.bold = True
+                if orig_font_size:
+                    new_run.font.size = orig_font_size
+                    
+                self._set_run_font(new_run, font_to_apply)
+                
+                # Lựa chọn màu sắc thông minh:
+                if is_white_or_light:
+                    # Nền tối: dùng màu xanh sáng (#E0F2FE) để nổi bật rực rỡ, không bị chìm
+                    new_run.font.color.rgb = RGBColor(224, 242, 254)
+                else:
+                    # Nền sáng: dùng màu xanh navy trang trọng, chuyên nghiệp
+                    new_run.font.color.rgb = RGBColor(0, 51, 102)
                 
         filename = self._get_output_filename(file_path)
         output_path = os.path.join(TEMP_DIR, filename)
@@ -445,8 +536,9 @@ class DocumentProcessor:
         
         for paragraph, trans in zip(shapes_to_translate, translations):
             if trans.lower() != paragraph.text.strip().lower():
+                clean_trans = trans.replace('\\t', '\t').replace('\\r', '\r').replace('\\n', '\n')
                 new_run = paragraph.add_run()
-                new_run.text = "\n" + trans
+                new_run.text = "\n" + clean_trans
                 new_run.font.italic = True
                 new_run.font.color.rgb = PptxRGBColor(0, 51, 102)
                 
@@ -543,13 +635,27 @@ st.markdown("<p class='sub-title'>Công cụ dịch thuật tài liệu đa đ�
 if not GROQ_API_KEYS:
     st.error("⚠️ Hệ thống chưa được cấu hình GROQ_API_KEY. Vui lòng thêm vào file .env hoặc tab Secrets của Streamlit Cloud!")
 
+LANGUAGE_OPTIONS = {
+    "English": "English (Tiếng Anh)",
+    "Vietnamese": "Vietnamese (Tiếng Việt)",
+    "Japanese": "Japanese (Tiếng Nhật)",
+    "Korean": "Korean (Tiếng Hàn)",
+    "Chinese (Simplified)": "Chinese (Tiếng Trung Giản Thể)",
+    "ThaiLan": "Thai (Tiếng Thái)",
+    "Portuguese": "Portuguese (Tiếng Bồ Đào Nha)"
+}
+
 with st.container():
     st.markdown("### ⚙️ Cấu hình hệ thống")
     col1, col2 = st.columns([1, 1])
     with col1:
-        target_lang = st.selectbox("🌍 Ngôn ngữ đích:", ["English", "Vietnamese", "Japanese", "Korean", "Chinese (Simplified)", "ThaiLan"])
+        target_lang = st.selectbox(
+            "🌍 Ngôn ngữ đích:",
+            options=list(LANGUAGE_OPTIONS.keys()),
+            format_func=lambda x: LANGUAGE_OPTIONS.get(x, x)
+        )
     with col2:
-        st.info("💡 Hỗ trợ giữ nguyên định dạng: **Word, Excel.")
+        st.info("💡 Hỗ trợ giữ nguyên định dạng: **Word, Excel**.")
 
 with st.container():
     st.markdown("### 📂 Tải tài liệu lên")
