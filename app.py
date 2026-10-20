@@ -1,5 +1,7 @@
 import os
 import streamlit as st
+
+st.set_page_config(page_title="Graphene Bilingual", page_icon="⚡", layout="centered")
 import openpyxl
 import docx
 from docx.shared import RGBColor, Pt
@@ -567,8 +569,6 @@ class DocumentProcessor:
         with open(output_path, "w", encoding="utf-8") as f:
             f.writelines(output_lines)
         return output_path
-
-st.set_page_config(page_title="Graphene Bilingual", page_icon="⚡", layout="centered")
 
 st.markdown("""
 <style>

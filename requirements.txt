@@ -1,6 +1,6 @@
 streamlit
 openpyxl
-python-docx
-python-pptx
+python-docx>=1.1.2
+python-pptx>=1.0.0
 python-dotenv
 requests
